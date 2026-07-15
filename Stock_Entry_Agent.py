@@ -350,16 +350,19 @@ def run_macro_engine(years: int = 6) -> dict:
 
     atomic_write_csv(panel.reset_index(drop=True), os.path.join(OUTPUT_DIR, "macro_panel.csv"))
 
+    def _r(val, digits):
+        return round(float(val), digits) if pd.notna(val) else np.nan
+
     latest = panel.iloc[-1]
     snapshot = {
         "DATE": latest["DATE"],
-        "MARKET_CONFIDENCE_SCORE": round(float(latest["MARKET_CONFIDENCE_SCORE"]), 1) if pd.notna(latest["MARKET_CONFIDENCE_SCORE"]) else np.nan,
+        "MARKET_CONFIDENCE_SCORE": _r(latest["MARKET_CONFIDENCE_SCORE"], 1),
         "REGIME_NAME": latest["REGIME_NAME"],
         "TRIPLE_BRAKE": int(latest["TRIPLE_BRAKE"]),
         "OVERHEAT": int(latest["OVERHEAT"]),
-        "TARGET_LEVERAGE": latest["TARGET_LEVERAGE"],
-        "VIX": latest.get("VIX", np.nan),
-        "HY_OAS": latest.get("HY_OAS", np.nan),
+        "TARGET_LEVERAGE": _r(latest.get("TARGET_LEVERAGE"), 2),
+        "VIX": _r(latest.get("VIX"), 1),
+        "HY_OAS": _r(latest.get("HY_OAS"), 2),
     }
     print(f"   → REGIME: {snapshot['REGIME_NAME']} | SCORE: {snapshot['MARKET_CONFIDENCE_SCORE']}")
     return snapshot
@@ -785,13 +788,17 @@ def build_final_dashboard(step3_df: pd.DataFrame, macro: dict) -> pd.DataFrame:
     healthy_pullback = trade["DRAWDOWN_CUR"].between(PULLBACK_MIN, PULLBACK_MAX)
     not_deep_risk = trade["MDD_1Y"] > DEEP_RISK_MDD
 
+    entry_cond = {
+        "LONG_TERM_UPTREND": trade["LONG_TERM_UPTREND"] == 1,
+        "RSI_DIP_ZONE": rsi_dip_zone.fillna(False),
+        "RSI_TURNING_UP": trade["RSI_TURNING_UP"] == 1,
+        "BB_LOWER_TOUCH": bb_lower_touch.fillna(False),
+        "HEALTHY_PULLBACK": healthy_pullback.fillna(False),
+        "NOT_DEEP_RISK": not_deep_risk.fillna(False),
+    }
+    trade["ENTRY_CONDITIONS_MET"] = sum(c.astype(int) for c in entry_cond.values())
     trade["ENTRY_SIGNAL"] = (
-        (trade["LONG_TERM_UPTREND"] == 1)
-        & rsi_dip_zone.fillna(False)
-        & (trade["RSI_TURNING_UP"] == 1)
-        & bb_lower_touch.fillna(False)
-        & healthy_pullback.fillna(False)
-        & not_deep_risk.fillna(False)
+        (trade["ENTRY_CONDITIONS_MET"] == len(entry_cond))
         & (trade["LIQUIDITY_FLAG"] == 1)
         & (not macro_block)
     ).astype(int)
@@ -799,17 +806,49 @@ def build_final_dashboard(step3_df: pd.DataFrame, macro: dict) -> pd.DataFrame:
     # ---- 보조 신호: 추세추종형 돌파(모멘텀 확장 + 변동성 수축 + 애널리스트 목표가 기준 손익비) ----
     # ENTRY_SIGNAL(눌림목 매수)과는 다른 전략이라 별도 컬럼으로 남겨둔다.
     # 두 신호가 동시에 뜨면 가장 강한 후보.
+    breakout_cond = {
+        "TREND_ALIGN": trade["TREND_ALIGN"] == 1,
+        "RS_MOMENTUM_POS": trade["RS_MOMENTUM"] > 0,
+        "ATR_CONTRACTING": trade["ATR_CONTRACTION"] < 0,
+        "RR_OK": trade["RR_TARGET"] >= 2,
+        "NOT_OVERBOUGHT": trade["RSI_14"] < RSI_OVERBOUGHT,
+    }
+    trade["BREAKOUT_CONDITIONS_MET"] = sum(c.astype(int) for c in breakout_cond.values())
     trade["BREAKOUT_SIGNAL"] = (
-        (trade["TREND_ALIGN"] == 1)
-        & (trade["RS_MOMENTUM"] > 0)
-        & (trade["ATR_CONTRACTION"] < 0)
-        & (trade["RR_TARGET"] >= 2)
-        & (trade["RSI_14"] < RSI_OVERBOUGHT)
+        (trade["BREAKOUT_CONDITIONS_MET"] == len(breakout_cond))
         & (not macro_block)
     ).astype(int)
 
-    trade["SIGNAL_COMBO"] = trade["ENTRY_SIGNAL"] + trade["BREAKOUT_SIGNAL"]
-    trade = trade.sort_values(["SIGNAL_COMBO", "ENTRY_SIGNAL", "SECTOR_SCORE", "STEP3_SCORE"], ascending=False).reset_index(drop=True)
+    # ---- 관심(WATCH) 등급: 완전한 신호는 아니지만 조건 대부분(1개만 부족)을 충족한 종목.
+    # ENTRY/BREAKOUT을 항상 엄격하게 유지하면서도(느슨하게 풀면 신호 품질이 떨어짐),
+    # 매일 전부 "관망"만 뜨는 것을 막기 위해 "거의 다 왔다"를 별도로 보여준다.
+    trade["ENTRY_NEAR"] = (
+        (trade["ENTRY_CONDITIONS_MET"] >= len(entry_cond) - 1) & (trade["ENTRY_SIGNAL"] == 0)
+    ).astype(int)
+    trade["BREAKOUT_NEAR"] = (
+        (trade["BREAKOUT_CONDITIONS_MET"] >= len(breakout_cond) - 1) & (trade["BREAKOUT_SIGNAL"] == 0)
+    ).astype(int)
+    trade["WATCH_SIGNAL"] = ((trade["ENTRY_NEAR"] == 1) | (trade["BREAKOUT_NEAR"] == 1)).astype(int)
+
+    def _tier(row):
+        if row["ENTRY_SIGNAL"] == 1 and row["BREAKOUT_SIGNAL"] == 1:
+            return "COMBO"
+        if row["ENTRY_SIGNAL"] == 1:
+            return "ENTRY"
+        if row["BREAKOUT_SIGNAL"] == 1:
+            return "BREAKOUT"
+        if row["WATCH_SIGNAL"] == 1:
+            return "WATCH"
+        return "NEUTRAL"
+
+    trade["SIGNAL_TIER"] = trade.apply(_tier, axis=1)
+    tier_rank = {"COMBO": 4, "ENTRY": 3, "BREAKOUT": 3, "WATCH": 2, "NEUTRAL": 1}
+    trade["SIGNAL_COMBO"] = trade["SIGNAL_TIER"].map(tier_rank)
+
+    trade = trade.sort_values(
+        ["SIGNAL_COMBO", "ENTRY_CONDITIONS_MET", "BREAKOUT_CONDITIONS_MET", "SECTOR_SCORE", "STEP3_SCORE"],
+        ascending=False,
+    ).reset_index(drop=True)
     trade["RANK"] = trade.index + 1
     return trade
 
@@ -866,15 +905,13 @@ def _fmt_ratio(x, digits=2):
     return "-" if pd.isna(x) else f"{x:.{digits}f}"
 
 
+_SIGNAL_BADGE_TEXT = {
+    "COMBO": "🔥동시", "ENTRY": "🎯눌림목", "BREAKOUT": "🚀돌파", "WATCH": "👀관심", "NEUTRAL": "",
+}
+
+
 def _signal_badge(r):
-    entry, breakout = r.get("ENTRY_SIGNAL") == 1, r.get("BREAKOUT_SIGNAL") == 1
-    if entry and breakout:
-        return "🔥동시"
-    if entry:
-        return "🎯눌림목"
-    if breakout:
-        return "🚀돌파"
-    return ""
+    return _SIGNAL_BADGE_TEXT.get(r.get("SIGNAL_TIER", "NEUTRAL"), "")
 
 
 def _earnings_badge(days_left):
@@ -975,13 +1012,14 @@ def render_html_report(trade: pd.DataFrame, macro: dict, out_path: str):
             "SHORT_FLOAT_PCT": _fmt_pct(r.get("SHORT_FLOAT_PCT")),
         }
         # 하이라이트 행은 라이트/다크 모드 모두에서 대비가 유지되도록 글자색을 고정한다.
-        bg = ""
-        if r.get("ENTRY_SIGNAL") == 1 and r.get("BREAKOUT_SIGNAL") == 1:
-            bg = "background:#c8f7c5;color:#1a1a1a;"
-        elif r.get("ENTRY_SIGNAL") == 1:
-            bg = "background:#eafaf1;color:#1a1a1a;"
-        elif r.get("BREAKOUT_SIGNAL") == 1:
-            bg = "background:#eaf4fb;color:#1a1a1a;"
+        tier = r.get("SIGNAL_TIER", "NEUTRAL")
+        bg_by_tier = {
+            "COMBO": "background:#c8f7c5;color:#1a1a1a;",
+            "ENTRY": "background:#eafaf1;color:#1a1a1a;",
+            "BREAKOUT": "background:#eaf4fb;color:#1a1a1a;",
+            "WATCH": "background:#fff8e1;color:#1a1a1a;",
+        }
+        bg = bg_by_tier.get(tier, "")
         cells = "".join(f"<td>{cell_values[c]}</td>" for c in table_cols)
         rows_html.append(f'<tr style="{bg}">{cells}</tr>')
 
@@ -998,14 +1036,13 @@ def render_html_report(trade: pd.DataFrame, macro: dict, out_path: str):
         if macro_chart_b64 else "<p>매크로 히스토리 없음</p>"
     )
 
-    n_entry = int((trade["ENTRY_SIGNAL"] == 1).sum())
-    n_breakout = int((trade["BREAKOUT_SIGNAL"] == 1).sum())
-    n_combo = int(((trade["ENTRY_SIGNAL"] == 1) & (trade["BREAKOUT_SIGNAL"] == 1)).sum())
+    tier_counts = trade["SIGNAL_TIER"].value_counts()
     kpi_cards = [
         ("전체 후보", len(trade), "#607d8b"),
-        ("🎯 눌림목(ENTRY)", n_entry, "#27ae60"),
-        ("🚀 돌파(BREAKOUT)", n_breakout, "#2980b9"),
-        ("🔥 동시신호", n_combo, "#e67e22"),
+        ("🎯 눌림목(ENTRY)", int(tier_counts.get("ENTRY", 0)), "#27ae60"),
+        ("🚀 돌파(BREAKOUT)", int(tier_counts.get("BREAKOUT", 0)), "#2980b9"),
+        ("🔥 동시신호", int(tier_counts.get("COMBO", 0)), "#e67e22"),
+        ("👀 관심(조건 근접)", int(tier_counts.get("WATCH", 0)), "#f1c40f"),
     ]
     kpi_html = "".join(
         f'<div class="kpi-card" style="border-top:3px solid {color};">'
@@ -1058,7 +1095,7 @@ def render_html_report(trade: pd.DataFrame, macro: dict, out_path: str):
 <div class="charts"><div>{macro_chart_html}</div></div>
 <h2>오늘의 후보 — 리스크 vs 리워드</h2>
 <div class="charts"><div>{risk_reward_html}</div></div>
-<h2>후보 리스트 (🔥동시신호 &gt; 🎯눌림목(ENTRY) &gt; 🚀돌파(BREAKOUT) 순 정렬)</h2>
+<h2>후보 리스트 (🔥동시신호 &gt; 🎯눌림목/🚀돌파 &gt; 👀관심(조건 근접) &gt; 관망 순 정렬)</h2>
 <div class="table-wrap">
 <table>
 <thead><tr>{header_html}</tr></thead>
@@ -1099,10 +1136,22 @@ def send_slack_message(payload: dict):
 _RANK_MEDAL = {1: "🥇", 2: "🥈", 3: "🥉"}
 
 
+_TIER_ICON = {
+    "COMBO": "🔥 *동시신호(눌림목+돌파)*",
+    "ENTRY": "🎯 *눌림목(ENTRY)*",
+    "BREAKOUT": "🚀 *돌파(BREAKOUT)*",
+    "WATCH": "👀 *관심(조건 근접)*",
+    "NEUTRAL": "⚪ *관망*",
+}
+
+
 def build_slack_payload(trade: pd.DataFrame, macro: dict, top_n: int = SLACK_TOP_N) -> dict:
     regime_icon = "🛑" if macro.get("TRIPLE_BRAKE") else ("⚠️" if macro.get("OVERHEAT") else "🟢")
-    n_entry = int((trade["ENTRY_SIGNAL"] == 1).sum())
-    n_breakout = int((trade["BREAKOUT_SIGNAL"] == 1).sum())
+    tier_counts = trade["SIGNAL_TIER"].value_counts() if "SIGNAL_TIER" in trade.columns else {}
+    n_combo = int(tier_counts.get("COMBO", 0))
+    n_entry = int(tier_counts.get("ENTRY", 0))
+    n_breakout = int(tier_counts.get("BREAKOUT", 0))
+    n_watch = int(tier_counts.get("WATCH", 0))
 
     blocks = [
         {"type": "header", "text": {"type": "plain_text",
@@ -1111,7 +1160,8 @@ def build_slack_payload(trade: pd.DataFrame, macro: dict, top_n: int = SLACK_TOP
             f"{regime_icon} *매크로 레짐:* {macro.get('REGIME_NAME', 'N/A')}  |  "
             f"*컨피던스:* {macro.get('MARKET_CONFIDENCE_SCORE', 'N/A')}  |  "
             f"*VIX:* {macro.get('VIX', 'N/A')}\n"
-            f"🎯 눌림목 {n_entry}개  |  🚀 돌파 {n_breakout}개  |  전체 후보 {len(trade)}개"
+            f"🔥 동시 {n_combo}  |  🎯 눌림목 {n_entry}  |  🚀 돌파 {n_breakout}  |  "
+            f"👀 관심 {n_watch}  |  전체 후보 {len(trade)}개"
         )}},
         {"type": "divider"},
     ]
@@ -1122,39 +1172,34 @@ def build_slack_payload(trade: pd.DataFrame, macro: dict, top_n: int = SLACK_TOP
     else:
         for _, row in top.iterrows():
             rank = int(row.get("RANK", 0))
-            entry, breakout = row.get("ENTRY_SIGNAL") == 1, row.get("BREAKOUT_SIGNAL") == 1
-            if entry and breakout:
-                icon = "🔥 *동시신호*"
-            elif entry:
-                icon = "🎯 *눌림목*"
-            elif breakout:
-                icon = "🚀 *돌파*"
-            else:
-                icon = "⚪ *관망*"
-
+            tier = row.get("SIGNAL_TIER", "NEUTRAL")
+            icon = _TIER_ICON.get(tier, _TIER_ICON["NEUTRAL"])
             medal = _RANK_MEDAL.get(rank, f"{rank}위")
+            gauge = upside_gauge(row.get("UPSIDE", 0))
+            earn = _earnings_badge(row.get("EARNINGS_DAYS_LEFT"))
             name = row.get("NAME") or row.get("TICKER", "")
             analyst_n = row.get("ANALYST_COUNT", 0)
             analyst_n = int(analyst_n) if pd.notna(analyst_n) else 0
-            upside_pct = row.get("UPSIDE", np.nan)
-            upside_txt = f"+{upside_pct * 100:.1f}%" if pd.notna(upside_pct) else "N/A"
 
-            header_text = (
+            text = (
                 f"{medal} *{row.get('TICKER', '')}* ({name})  _[{row.get('THEME', '')}]_  {icon}\n"
-                f"{_earnings_badge(row.get('EARNINGS_DAYS_LEFT'))}  실적발표"
+                f"• *상승여력:* `{gauge}`\n"
+                f"• *실적 일정:* {earn}\n"
+                f"• *현재가:* `{_fmt_price(row.get('CLOSE'))}` | *애널목표가:* `{_fmt_price(row.get('TARGET_PRICE'))}`\n"
+                f"• *RSI:* `{_fmt_score(row.get('RSI_14'))}` | *밴드%B:* `{_fmt_ratio(row.get('BB_PCT_B'))}` "
+                f"| *1Y고점대비:* `{_fmt_pct(row.get('DRAWDOWN_CUR'))}`\n"
+                f"• *손익비(RR_TARGET):* `{_fmt_ratio(row.get('RR_TARGET'))}`\n"
+                f"• *컨센서스:* `{str(row.get('REC_KEY', '')).upper()}` ({analyst_n}곳)\n"
+                f"• *실적점수:* `{_fmt_score(row.get('STEP2_SCORE'))}` | *가격점수:* `{_fmt_score(row.get('STEP3_SCORE'))}` "
+                f"| *후보군내 상대강도:* `{_fmt_score(row.get('RS_RANK'))}`"
             )
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": header_text}})
-            blocks.append({
-                "type": "section",
-                "fields": [
-                    {"type": "mrkdwn", "text": f"*현재가*\n`{_fmt_price(row.get('CLOSE'))}`"},
-                    {"type": "mrkdwn", "text": f"*목표가({analyst_n}곳)*\n`{_fmt_price(row.get('TARGET_PRICE'))}` ({upside_txt})"},
-                    {"type": "mrkdwn", "text": f"*RSI / 밴드%B*\n`{_fmt_score(row.get('RSI_14'))} / {_fmt_ratio(row.get('BB_PCT_B'))}`"},
-                    {"type": "mrkdwn", "text": f"*1Y고점대비*\n`{_fmt_pct(row.get('DRAWDOWN_CUR'))}`"},
-                    {"type": "mrkdwn", "text": f"*손익비 / 컨센서스*\n`{_fmt_ratio(row.get('RR_TARGET'))}` / {str(row.get('REC_KEY', '')).upper()}"},
-                    {"type": "mrkdwn", "text": f"*실적점수 / 가격점수 / 상대강도*\n`{_fmt_score(row.get('STEP2_SCORE'))} / {_fmt_score(row.get('STEP3_SCORE'))} / {_fmt_score(row.get('RS_RANK'))}`"},
-                ],
-            })
+            if tier in ("WATCH", "NEUTRAL"):
+                text += (
+                    f"\n• *신호 근접도:* 눌림목조건 {int(row.get('ENTRY_CONDITIONS_MET', 0))}/6"
+                    f", 돌파조건 {int(row.get('BREAKOUT_CONDITIONS_MET', 0))}/5"
+                )
+
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
             blocks.append({"type": "divider"})
 
     if REPORT_PAGE_URL:
@@ -1261,7 +1306,7 @@ def main():
     # 누적 히스토리
     hist_path = os.path.join(OUTPUT_DIR, "daily_snapshot_history.csv")
     snap_cols = [
-        "TICKER", "THEME", "CLOSE", "STEP2_SCORE", "STEP3_SCORE",
+        "TICKER", "THEME", "CLOSE", "STEP2_SCORE", "STEP3_SCORE", "SIGNAL_TIER",
         "ENTRY_SIGNAL", "BREAKOUT_SIGNAL", "RSI_14", "BB_PCT_B", "DRAWDOWN_CUR",
     ]
     snap_cols = [c for c in snap_cols if c in dashboard.columns]
@@ -1277,10 +1322,12 @@ def main():
 
     print(f"\n✅ 완료: {csv_path}")
     print(f"✅ 완료: {html_path}")
-    n_entry = int(dashboard["ENTRY_SIGNAL"].sum())
-    n_breakout = int(dashboard["BREAKOUT_SIGNAL"].sum())
-    n_combo = int(((dashboard["ENTRY_SIGNAL"] == 1) & (dashboard["BREAKOUT_SIGNAL"] == 1)).sum())
-    print(f"📌 ENTRY_SIGNAL(눌림목): {n_entry}개 | BREAKOUT_SIGNAL(돌파): {n_breakout}개 | 동시신호: {n_combo}개 / {len(dashboard)}개 후보")
+    tc = dashboard["SIGNAL_TIER"].value_counts()
+    print(
+        f"📌 동시:{int(tc.get('COMBO', 0))} | 눌림목:{int(tc.get('ENTRY', 0))} | "
+        f"돌파:{int(tc.get('BREAKOUT', 0))} | 관심:{int(tc.get('WATCH', 0))} | "
+        f"관망:{int(tc.get('NEUTRAL', 0))} / {len(dashboard)}개 후보"
+    )
 
     if ENABLE_SLACK:
         send_slack_message(build_slack_payload(dashboard, macro))
