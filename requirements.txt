@@ -1,0 +1,6 @@
+pandas==3.0.0
+numpy==2.4.2
+requests
+yfinance==1.1.0
+fredapi
+matplotlib==3.10.8

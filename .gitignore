@@ -1,0 +1,15 @@
+# 임시/락 방어용 파일 (atomic_write_csv가 만드는 중간 산출물)
+output/**/*_tmp_*.csv
+output/**/*_fallback_*.csv
+
+__pycache__/
+*.pyc
+.DS_Store
+.claude/
+
+# 구버전 스크립트(하드코딩된 API 키/웹훅 포함) - 공개 저장소에 절대 올리지 않음
+1.STOCK_CANDIDATE.PY
+1.StockRaw.py
+2.STOCK.PY
+3.Recommended_STOCK.PY
+4.STOCK_BI.PY

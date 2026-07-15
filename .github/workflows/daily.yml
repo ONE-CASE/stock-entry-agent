@@ -1,0 +1,46 @@
+name: Stock Entry Agent Daily Run
+
+on:
+  schedule:
+    # 매주 평일(월~금) 09:00 KST = 00:00 UTC
+    - cron: "0 0 * * 1-5"
+  workflow_dispatch: {}   # Actions 탭에서 수동으로도 실행 가능
+
+permissions:
+  contents: write   # output/ 결과와 docs/index.html을 저장소에 커밋하기 위해 필요
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Stock Entry Agent
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ENABLE_SLACK: "true"
+        run: python Stock_Entry_Agent.py
+
+      - name: Publish latest report to GitHub Pages (docs/)
+        run: |
+          mkdir -p docs
+          cp output/entry_signal_latest.html docs/index.html
+
+      - name: Commit results back to repo
+        run: |
+          git config user.name "stock-entry-agent-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add output/ docs/
+          git diff --cached --quiet || git commit -m "chore: daily run $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
