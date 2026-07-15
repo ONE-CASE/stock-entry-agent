@@ -98,6 +98,8 @@ STOP_ATR_MULTIPLIER = 1.5
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 ENABLE_SLACK = os.getenv("ENABLE_SLACK", "false").strip().lower() == "true"
 SLACK_TOP_N = 10
+# GitHub Pages에 매일 발행되는 전체 리포트 URL (Slack 메시지에 "전체 리포트 보기" 버튼으로 첨부)
+REPORT_PAGE_URL = os.getenv("REPORT_PAGE_URL", "https://one-case.github.io/stock-entry-agent/")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -894,20 +896,25 @@ def render_risk_reward_chart(trade: pd.DataFrame) -> str:
     d = trade.dropna(subset=["ATR_PCT", "UPSIDE"]).copy()
     if d.empty:
         return ""
-    fig, ax = plt.subplots(figsize=(6.2, 4.6))
-    colors = np.where(
-        (d["ENTRY_SIGNAL"] == 1) | (d["BREAKOUT_SIGNAL"] == 1), "#27ae60", "#3498db"
-    )
-    ax.scatter(d["ATR_PCT"] * 100, d["UPSIDE"] * 100, c=colors, s=70, alpha=0.85,
-               edgecolors="white", linewidths=0.6, zorder=3)
+    themes = sorted(d["THEME"].unique())
+    cmap = plt.colormaps.get_cmap("tab20")
+    theme_color = {t: cmap(i / max(len(themes) - 1, 1)) for i, t in enumerate(themes)}
+
+    fig, ax = plt.subplots(figsize=(7.4, 5.2))
+    for t in themes:
+        sub = d[d["THEME"] == t]
+        ax.scatter(sub["ATR_PCT"] * 100, sub["UPSIDE"] * 100, label=t, s=75, alpha=0.88,
+                   color=theme_color[t], edgecolors="white", linewidths=0.6, zorder=3)
     for _, r in d.iterrows():
-        ax.annotate(r["TICKER"], (r["ATR_PCT"] * 100, r["UPSIDE"] * 100),
-                    fontsize=8, xytext=(5, 4), textcoords="offset points")
+        star = "★ " if (r["ENTRY_SIGNAL"] == 1 or r["BREAKOUT_SIGNAL"] == 1) else ""
+        ax.annotate(f"{star}{r['TICKER']}", (r["ATR_PCT"] * 100, r["UPSIDE"] * 100),
+                    fontsize=7.5, xytext=(5, 4), textcoords="offset points")
     ax.axhline(0, color="#bbb", linewidth=0.8, linestyle="--", zorder=1)
     ax.set_xlabel("변동성 ATR (%)")
     ax.set_ylabel("애널리스트 상승여력 (%)")
-    ax.set_title("리스크 vs 리워드 (초록 = 오늘 신호 발생)")
+    ax.set_title("리스크 vs 리워드 (★ = 오늘 신호 발생, 색상 = 테마)")
     ax.grid(alpha=0.25)
+    ax.legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0, frameon=False)
     fig.tight_layout()
     return _fig_to_base64(fig)
 
@@ -967,13 +974,14 @@ def render_html_report(trade: pd.DataFrame, macro: dict, out_path: str):
             "EARNINGS": _earnings_badge(r.get("EARNINGS_DAYS_LEFT")),
             "SHORT_FLOAT_PCT": _fmt_pct(r.get("SHORT_FLOAT_PCT")),
         }
+        # 하이라이트 행은 라이트/다크 모드 모두에서 대비가 유지되도록 글자색을 고정한다.
         bg = ""
         if r.get("ENTRY_SIGNAL") == 1 and r.get("BREAKOUT_SIGNAL") == 1:
-            bg = "background:#c8f7c5;"
+            bg = "background:#c8f7c5;color:#1a1a1a;"
         elif r.get("ENTRY_SIGNAL") == 1:
-            bg = "background:#eafaf1;"
+            bg = "background:#eafaf1;color:#1a1a1a;"
         elif r.get("BREAKOUT_SIGNAL") == 1:
-            bg = "background:#eaf4fb;"
+            bg = "background:#eaf4fb;color:#1a1a1a;"
         cells = "".join(f"<td>{cell_values[c]}</td>" for c in table_cols)
         rows_html.append(f'<tr style="{bg}">{cells}</tr>')
 
@@ -990,20 +998,53 @@ def render_html_report(trade: pd.DataFrame, macro: dict, out_path: str):
         if macro_chart_b64 else "<p>매크로 히스토리 없음</p>"
     )
 
+    n_entry = int((trade["ENTRY_SIGNAL"] == 1).sum())
+    n_breakout = int((trade["BREAKOUT_SIGNAL"] == 1).sum())
+    n_combo = int(((trade["ENTRY_SIGNAL"] == 1) & (trade["BREAKOUT_SIGNAL"] == 1)).sum())
+    kpi_cards = [
+        ("전체 후보", len(trade), "#607d8b"),
+        ("🎯 눌림목(ENTRY)", n_entry, "#27ae60"),
+        ("🚀 돌파(BREAKOUT)", n_breakout, "#2980b9"),
+        ("🔥 동시신호", n_combo, "#e67e22"),
+    ]
+    kpi_html = "".join(
+        f'<div class="kpi-card" style="border-top:3px solid {color};">'
+        f'<div class="kpi-value">{value}</div><div class="kpi-label">{label}</div></div>'
+        for label, value, color in kpi_cards
+    )
+
     html = f"""<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Stock Entry Agent - {macro.get('DATE', '')}</title>
 <style>
-  body {{ font-family: "Malgun Gothic", -apple-system, Segoe UI, sans-serif; margin: 24px; color: #222; }}
-  h1 {{ font-size: 20px; }}
-  h2 {{ font-size: 15px; margin-top: 28px; }}
-  .macro-banner {{ padding: 12px 16px; border-radius: 8px; color: white; background: {regime_color}; margin-bottom: 16px; }}
+  :root {{
+    --bg: #ffffff; --fg: #222; --card-bg: #f7f7f8; --border: #ddd; --th-bg: #f4f4f4;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{ --bg: #16181c; --fg: #e6e6e6; --card-bg: #22252a; --border: #3a3d42; --th-bg: #23262b; }}
+  }}
+  body {{ font-family: "Malgun Gothic", -apple-system, Segoe UI, sans-serif; margin: 16px;
+          background: var(--bg); color: var(--fg); }}
+  h1 {{ font-size: 19px; }}
+  h2 {{ font-size: 14px; margin-top: 26px; }}
+  .macro-banner {{ padding: 12px 16px; border-radius: 8px; color: white; background: {regime_color}; margin-bottom: 14px; }}
+  .kpi-row {{ display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }}
+  .kpi-card {{ background: var(--card-bg); border-radius: 8px; padding: 10px 16px; flex: 1 1 130px; text-align: center; }}
+  .kpi-value {{ font-size: 22px; font-weight: 700; }}
+  .kpi-label {{ font-size: 12px; opacity: 0.75; margin-top: 2px; }}
   .charts {{ display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }}
-  .charts > div {{ flex: 1 1 380px; }}
+  .charts > div {{ flex: 1 1 340px; max-width: 100%; }}
+  .charts img {{ border-radius: 8px; }}
   table {{ border-collapse: collapse; width: 100%; font-size: 12.5px; margin-top: 8px; }}
-  th, td {{ border: 1px solid #ddd; padding: 5px 7px; text-align: right; white-space: nowrap; }}
-  th {{ background: #f4f4f4; position: sticky; top: 0; }}
+  th, td {{ border: 1px solid var(--border); padding: 5px 7px; text-align: right; white-space: nowrap; }}
+  th {{ background: var(--th-bg); position: sticky; top: 0; }}
   td:nth-child(2), td:nth-child(3), td:nth-child(4) {{ text-align: left; }}
-  .table-wrap {{ overflow-x: auto; }}
+  .table-wrap {{ overflow-x: auto; -webkit-overflow-scrolling: touch; }}
+  @media (max-width: 480px) {{
+    body {{ margin: 8px; }}
+    table {{ font-size: 11px; }}
+    th, td {{ padding: 4px 5px; }}
+  }}
 </style>
 <h1>📈 Stock Entry Agent — {macro.get('DATE', '')}</h1>
 <div class="macro-banner">
@@ -1012,6 +1053,7 @@ def render_html_report(trade: pd.DataFrame, macro: dict, out_path: str):
   <b>목표 레버리지:</b> {macro.get('TARGET_LEVERAGE', 'N/A')} &nbsp; | &nbsp;
   <b>VIX:</b> {macro.get('VIX', 'N/A')}
 </div>
+<div class="kpi-row">{kpi_html}</div>
 <h2>매크로 추이</h2>
 <div class="charts"><div>{macro_chart_html}</div></div>
 <h2>오늘의 후보 — 리스크 vs 리워드</h2>
@@ -1054,15 +1096,22 @@ def send_slack_message(payload: dict):
         print(f"⚠ Slack 전송 오류: {e}")
 
 
+_RANK_MEDAL = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+
 def build_slack_payload(trade: pd.DataFrame, macro: dict, top_n: int = SLACK_TOP_N) -> dict:
     regime_icon = "🛑" if macro.get("TRIPLE_BRAKE") else ("⚠️" if macro.get("OVERHEAT") else "🟢")
+    n_entry = int((trade["ENTRY_SIGNAL"] == 1).sum())
+    n_breakout = int((trade["BREAKOUT_SIGNAL"] == 1).sum())
+
     blocks = [
         {"type": "header", "text": {"type": "plain_text",
          "text": f"📈 오늘의 진입 후보 TOP{top_n} — {macro.get('DATE', '')}"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": (
             f"{regime_icon} *매크로 레짐:* {macro.get('REGIME_NAME', 'N/A')}  |  "
             f"*컨피던스:* {macro.get('MARKET_CONFIDENCE_SCORE', 'N/A')}  |  "
-            f"*VIX:* {macro.get('VIX', 'N/A')}"
+            f"*VIX:* {macro.get('VIX', 'N/A')}\n"
+            f"🎯 눌림목 {n_entry}개  |  🚀 돌파 {n_breakout}개  |  전체 후보 {len(trade)}개"
         )}},
         {"type": "divider"},
     ]
@@ -1070,39 +1119,53 @@ def build_slack_payload(trade: pd.DataFrame, macro: dict, top_n: int = SLACK_TOP
     top = trade.head(top_n)
     if top.empty:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "오늘은 후보 종목이 없습니다."}})
-        return {"blocks": blocks}
+    else:
+        for _, row in top.iterrows():
+            rank = int(row.get("RANK", 0))
+            entry, breakout = row.get("ENTRY_SIGNAL") == 1, row.get("BREAKOUT_SIGNAL") == 1
+            if entry and breakout:
+                icon = "🔥 *동시신호*"
+            elif entry:
+                icon = "🎯 *눌림목*"
+            elif breakout:
+                icon = "🚀 *돌파*"
+            else:
+                icon = "⚪ *관망*"
 
-    for _, row in top.iterrows():
-        entry, breakout = row.get("ENTRY_SIGNAL") == 1, row.get("BREAKOUT_SIGNAL") == 1
-        if entry and breakout:
-            icon = "🔥 *동시신호(눌림목+돌파)*"
-        elif entry:
-            icon = "🎯 *눌림목(ENTRY)*"
-        elif breakout:
-            icon = "🚀 *돌파(BREAKOUT)*"
-        else:
-            icon = "⚪ *관망*"
+            medal = _RANK_MEDAL.get(rank, f"{rank}위")
+            name = row.get("NAME") or row.get("TICKER", "")
+            analyst_n = row.get("ANALYST_COUNT", 0)
+            analyst_n = int(analyst_n) if pd.notna(analyst_n) else 0
+            upside_pct = row.get("UPSIDE", np.nan)
+            upside_txt = f"+{upside_pct * 100:.1f}%" if pd.notna(upside_pct) else "N/A"
 
-        gauge = upside_gauge(row.get("UPSIDE", 0))
-        earn = _earnings_badge(row.get("EARNINGS_DAYS_LEFT"))
-        name = row.get("NAME") or row.get("TICKER", "")
-        analyst_n = row.get("ANALYST_COUNT", 0)
-        analyst_n = int(analyst_n) if pd.notna(analyst_n) else 0
+            header_text = (
+                f"{medal} *{row.get('TICKER', '')}* ({name})  _[{row.get('THEME', '')}]_  {icon}\n"
+                f"{_earnings_badge(row.get('EARNINGS_DAYS_LEFT'))}  실적발표"
+            )
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": header_text}})
+            blocks.append({
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*현재가*\n`{_fmt_price(row.get('CLOSE'))}`"},
+                    {"type": "mrkdwn", "text": f"*목표가({analyst_n}곳)*\n`{_fmt_price(row.get('TARGET_PRICE'))}` ({upside_txt})"},
+                    {"type": "mrkdwn", "text": f"*RSI / 밴드%B*\n`{_fmt_score(row.get('RSI_14'))} / {_fmt_ratio(row.get('BB_PCT_B'))}`"},
+                    {"type": "mrkdwn", "text": f"*1Y고점대비*\n`{_fmt_pct(row.get('DRAWDOWN_CUR'))}`"},
+                    {"type": "mrkdwn", "text": f"*손익비 / 컨센서스*\n`{_fmt_ratio(row.get('RR_TARGET'))}` / {str(row.get('REC_KEY', '')).upper()}"},
+                    {"type": "mrkdwn", "text": f"*실적점수 / 가격점수 / 상대강도*\n`{_fmt_score(row.get('STEP2_SCORE'))} / {_fmt_score(row.get('STEP3_SCORE'))} / {_fmt_score(row.get('RS_RANK'))}`"},
+                ],
+            })
+            blocks.append({"type": "divider"})
 
-        text = (
-            f"*{int(row.get('RANK', 0))}위. {row.get('TICKER', '')}* ({name})  _[{row.get('THEME', '')}]_  {icon}\n"
-            f"• *상승여력:* `{gauge}`\n"
-            f"• *실적 일정:* {earn}\n"
-            f"• *현재가:* `{_fmt_price(row.get('CLOSE'))}` | *애널목표가:* `{_fmt_price(row.get('TARGET_PRICE'))}`\n"
-            f"• *RSI:* `{_fmt_score(row.get('RSI_14'))}` | *밴드%B:* `{_fmt_ratio(row.get('BB_PCT_B'))}` "
-            f"| *1Y고점대비:* `{_fmt_pct(row.get('DRAWDOWN_CUR'))}`\n"
-            f"• *손익비(RR_TARGET):* `{_fmt_ratio(row.get('RR_TARGET'))}`\n"
-            f"• *컨센서스:* `{str(row.get('REC_KEY', '')).upper()}` ({analyst_n}곳)\n"
-            f"• *실적점수:* `{_fmt_score(row.get('STEP2_SCORE'))}` | *가격점수:* `{_fmt_score(row.get('STEP3_SCORE'))}` "
-            f"| *후보군내 상대강도:* `{_fmt_score(row.get('RS_RANK'))}`"
-        )
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
-        blocks.append({"type": "divider"})
+    if REPORT_PAGE_URL:
+        blocks.append({
+            "type": "actions",
+            "elements": [{
+                "type": "button",
+                "text": {"type": "plain_text", "text": "📊 전체 리포트 보기"},
+                "url": REPORT_PAGE_URL,
+            }],
+        })
 
     return {"blocks": blocks}
 
